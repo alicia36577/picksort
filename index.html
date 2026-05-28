@@ -113,6 +113,21 @@ input[type=range]{flex:1;accent-color:var(--accent);cursor:pointer;}
 .modal-arr{pointer-events:all;background:var(--bg2);border:1px solid var(--border);color:var(--text2);font-family:var(--mono);font-size:16px;width:36px;height:60px;border-radius:3px;cursor:pointer;transition:border-color .15s,color .15s;}
 .modal-arr:hover{border-color:var(--accent);color:var(--accent);}
 .modal-arr:disabled{opacity:.25;cursor:not-allowed;}
+
+/* 추천 박스 */
+#rec{display:none;margin-bottom:20px;border:1px solid #2e2a1f;border-radius:4px;background:#141008;overflow:hidden;}
+.rec-header{display:flex;align-items:center;justify-content:space-between;padding:11px 15px;border-bottom:1px solid #2e2a1f;}
+.rec-title{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);}
+.rec-analyzing{font-size:11px;color:var(--text3);}
+.rec-body{padding:14px 15px;display:flex;flex-direction:column;gap:10px;}
+.rec-row{display:flex;align-items:flex-start;gap:12px;}
+.rec-label{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--text3);width:110px;flex-shrink:0;padding-top:2px;}
+.rec-val{font-family:var(--serif);font-size:22px;color:var(--accent);line-height:1;margin-right:8px;}
+.rec-desc{font-size:11px;color:var(--text2);line-height:1.5;}
+.rec-apply{display:block;width:100%;margin-top:4px;padding:10px;background:none;border:1px solid #3a3020;border-radius:3px;color:var(--accent);font-family:var(--mono);font-size:11px;letter-spacing:.1em;cursor:pointer;transition:border-color .15s,background .15s;}
+.rec-apply:hover{border-color:var(--accent);background:#1e1a0e;}
+.rec-spinner{display:inline-block;width:10px;height:10px;border:1.5px solid var(--text3);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -133,10 +148,33 @@ input[type=range]{flex:1;accent-color:var(--accent);cursor:pointer;}
   </div>
   <div class="file-count" id="fc"></div>
 
+  <div id="rec">
+    <div class="rec-header">
+      <span class="rec-title">✦ &nbsp;추천 설정값</span>
+      <span class="rec-analyzing" id="rec-status"><span class="rec-spinner"></span>사진 분석 중…</span>
+    </div>
+    <div class="rec-body" id="rec-body" style="display:none;">
+      <div class="rec-row">
+        <span class="rec-label">흔들림 기준값</span>
+        <div>
+          <span class="rec-val" id="rec-bv">—</span>
+          <div class="rec-desc" id="rec-bd"></div>
+        </div>
+      </div>
+      <div class="rec-row">
+        <span class="rec-label">유사도 거리</span>
+        <div>
+          <span class="rec-val" id="rec-hv">—</span>
+          <div class="rec-desc" id="rec-hd"></div>
+        </div>
+      </div>
+      <button class="rec-apply" id="rec-apply">↑ &nbsp;슬라이더에 추천값 적용</button>
+    </div>
+  </div>
   <div class="sliders">
     <div class="sf">
       <label>흔들림 기준값 (Blur Threshold)</label>
-      <div class="sr"><input type="range" id="bs" min="20" max="300" value="100"><span class="sv" id="bv">100</span></div>
+      <div class="sr"><input type="range" id="bs" min="100" max="30000" value="1000"><span class="sv" id="bv">1000</span></div>
       <div class="sd">낮을수록 엄격하게 흔들림 판정</div>
     </div>
     <div class="sf">
@@ -270,6 +308,103 @@ function brightness(imgData){
   return (sum/n)*255;
 }
 
+
+// ─── 추천값 분석 ─────────────────────────────────────────
+async function analyzeRecommend(arr, urls){
+  const recEl=document.getElementById('rec');
+  const recStatus=document.getElementById('rec-status');
+  const recBody=document.getElementById('rec-body');
+  recEl.style.display='block';
+  recBody.style.display='none';
+  recStatus.innerHTML='<span class="rec-spinner"></span>사진 분석 중…';
+
+  // 샘플 최대 30장 (속도)
+  const sample=arr.length>30
+    ? arr.map((_,i)=>i).sort(()=>Math.random()-.5).slice(0,30)
+    : arr.map((_,i)=>i);
+
+  const blurs=[], hashes=[];
+  for(const i of sample){
+    await tick();
+    const imgData=await dataURLtoImageData(urls[i], 800);
+    blurs.push(lapVar(imgData));
+    hashes.push(dhash(imgData));
+  }
+
+  // 선명도 분포 분석
+  const sorted=[...blurs].sort((a,b)=>a-b);
+  const med=sorted[Math.floor(sorted.length/2)];
+  const p25=sorted[Math.floor(sorted.length*0.25)];
+  const p75=sorted[Math.floor(sorted.length*0.75)];
+
+  const maxBlur = sorted[sorted.length - 1];
+  const minBlur = sorted[0];
+
+  // 전략: 가장 선명한 사진의 60%를 기준선으로 사용
+  // → 최고 품질 대비 40% 이상 떨어지는 사진은 흔들림으로 판정
+  // 단, 모든 사진이 비슷하게 흔들렸을 때(범위가 좁을 때)는
+  //   기준을 낮춰서 억울하게 전부 삭제되지 않도록 중앙값 * 0.6으로 fallback
+  let recBlur;
+  const spreadRatio = maxBlur > 0 ? (maxBlur - minBlur) / maxBlur : 0;
+  if(spreadRatio > 0.3){
+    // 품질 차이가 뚜렷한 묶음 → 최댓값 60% 기준
+    recBlur = Math.round(maxBlur * 0.6);
+  } else {
+    // 품질이 고른 묶음 → 중앙값 60% 기준 (너무 엄격하지 않게)
+    recBlur = Math.round(med * 0.6);
+  }
+  recBlur = Math.max(100, Math.min(30000, recBlur));
+
+  // 해밍 거리 분포 분석 (샘플 쌍)
+  const dists=[];
+  for(let i=0;i<hashes.length;i++)
+    for(let j=i+1;j<hashes.length;j++)
+      dists.push(hamming(hashes[i],hashes[j]));
+
+  let recHash=10;
+  if(dists.length>0){
+    const ds=[...dists].sort((a,b)=>a-b);
+    // 하위 5% 거리 (매우 유사한 쌍들의 최대거리)를 기준으로
+    const p5=ds[Math.max(0,Math.floor(ds.length*0.05))];
+    // 하위 5%가 0이면 5, 아니면 p5+2 (여유 포함)
+    recHash=Math.max(1,Math.min(30, p5===0 ? 5 : p5+2));
+  }
+
+  // 설명 문구
+  const blurDesc=(()=>{
+    const q = maxBlur < 1500 ? '전체적으로 흔들린 묶음'
+            : maxBlur < 5000 ? '보통 수준 묶음'
+            : maxBlur < 15000? '선명한 사진 포함'
+            : '고품질 사진 포함';
+    return `선명도 최대 ${maxBlur.toFixed(0)} · 중앙값 ${med.toFixed(0)} · ${q}`;
+  })();
+
+  const dupRatio=dists.length>0
+    ? (dists.filter(d=>d<=recHash).length/dists.length*100).toFixed(0) : 0;
+  const hashDesc=`유사 쌍 약 ${dupRatio}% 감지 · `+
+    (recHash<=5?'중복 판정 엄격':recHash<=12?'중복 판정 보통':'중복 판정 넓게');
+
+  document.getElementById('rec-bv').textContent=recBlur;
+  document.getElementById('rec-bd').textContent=blurDesc;
+  document.getElementById('rec-hv').textContent=recHash;
+  document.getElementById('rec-hd').textContent=hashDesc;
+
+  // 분석 완료 즉시 슬라이더에 자동 적용
+  bs.value=recBlur; bv.textContent=recBlur;
+  hs.value=recHash; hv_el.textContent=recHash;
+
+  recStatus.textContent='분석 완료 · 자동 적용됨';
+  recBody.style.display='flex';
+
+  // 적용 버튼 (수동 재적용용)
+  document.getElementById('rec-apply').onclick=()=>{
+    bs.value=recBlur; bv.textContent=recBlur;
+    hs.value=recHash; hv_el.textContent=recHash;
+    document.getElementById('rec-apply').textContent='✓ &nbsp;적용됨';
+    setTimeout(()=>{document.getElementById('rec-apply').textContent='↑ &nbsp;슬라이더에 추천값 적용';},1500);
+  };
+}
+
 // ─── Union-Find 그룹핑 ────────────────────────────────
 function groupBy(items, thr){
   const p=new Map(items.map(it=>[it,it]));
@@ -319,6 +454,7 @@ async function load(fileList){
   if(!arr.length)return;
   files=arr; dataURLs=[]; th.innerHTML='';
   dz.classList.remove('has-files');
+  document.getElementById('rec').style.display='none';
   dh_el.style.display='none';
   err.style.display='none';
   summary.style.display='none';
@@ -337,6 +473,7 @@ async function load(fileList){
   fc.textContent=`${arr.length}장 선택됨 (클릭해서 변경)`;
   runBtn.disabled=false;
   dz.classList.add('has-files');
+  analyzeRecommend(arr, dataURLs);
 }
 
 // 썸네일 표시 후 드롭존 클릭 시 파일 선택창 열기
@@ -368,7 +505,7 @@ async function run(){
     for(let i=0;i<total;i++){
       prog(5+Math.round((i/total)*40), `해시 계산 중… ${i+1}/${total}`);
       await tick();
-      const imgData=await dataURLtoImageData(dataURLs[i]);
+      const imgData=await dataURLtoImageData(dataURLs[i], 800);
       const hash=dhash(imgData);
       items.push({file:files[i], dataURL:dataURLs[i], imgData, hash});
     }
@@ -379,20 +516,55 @@ async function run(){
     const groups=groupBy(items, hashThr);
 
     // 3단계: 품질 평가 + 분류
+    // 전체 사진 선명도 먼저 계산
+    const allScored = items.map(it=>score(it, blurThr));
+    // 전체 최고 선명도 (단독 사진 판단 기준용)
+    const globalMax = Math.max(...allScored.map(s=>s.blur));
+
     const kept=[], deleted=[];
     for(let g=0;g<groups.length;g++){
       prog(50+Math.round((g/groups.length)*45),`품질 평가 중… ${g+1}/${groups.length}그룹`);
       await tick();
       const grp=groups[g];
+      // 이미 계산된 score 재사용 (items 인덱스로 매핑)
+      const sc=grp.map(it=>{
+        const idx=items.indexOf(it);
+        return allScored[idx];
+      }).sort((a,b)=>b.quality-a.quality);
+      const best=sc[0];
+      const groupMax=best.blur;
+
       if(grp.length===1){
-        const s=score(grp[0],blurThr);
-        kept.push({...s, rtype:'단독', reason:'중복 없음 → 저장'});
-      }else{
-        const sc=grp.map(it=>score(it,blurThr)).sort((a,b)=>b.quality-a.quality);
-        kept.push({...sc[0], rtype:'베스트', reason:`선명도 ${sc[0].blur.toFixed(0)} · 베스트컷`});
-        for(const s of sc.slice(1)){
-          const why=s.isBlurry?'흔들림':s.badExp?'노출불량':'저품질';
-          deleted.push({...s, rtype:'삭제', reason:`${why} · 선명도 ${s.blur.toFixed(0)}`});
+        // 단독 사진: 전체 최고 선명도 대비 상대 비교
+        // globalMax 대비 25% 미만이면 흔들림으로 판정
+        const isBlurryGlobal = best.blur < globalMax * 0.25;
+        if(isBlurryGlobal){
+          deleted.push({...best, rtype:'삭제', reason:`흔들림 · 선명도 ${best.blur.toFixed(0)}`});
+        } else if(best.badExp){
+          deleted.push({...best, rtype:'삭제', reason:`노출불량 · 밝기 ${best.brt.toFixed(0)}`});
+        } else {
+          kept.push({...best, rtype:'단독', reason:'중복 없음 → 저장'});
+        }
+      } else {
+        // 그룹 사진: 그룹 내 상대 비교
+        // 그룹 베스트도 전체 최고 대비 25% 미만이면 그룹 전원 흔들림
+        const bestBlurryGlobal = best.blur < globalMax * 0.25;
+        if(bestBlurryGlobal){
+          for(const s of sc){
+            deleted.push({...s, rtype:'삭제', reason:`흔들림(전원) · 선명도 ${s.blur.toFixed(0)}`});
+          }
+        } else {
+          kept.push({...best, rtype:'베스트', reason:`선명도 ${best.blur.toFixed(0)} · 베스트컷`});
+          for(const s of sc.slice(1)){
+            // 그룹 베스트 대비 55% 미만이면 흔들림
+            if(isBlurryRelative(s.blur, groupMax)){
+              deleted.push({...s, rtype:'삭제', reason:`흔들림 · 선명도 ${s.blur.toFixed(0)}`});
+            } else if(s.badExp){
+              deleted.push({...s, rtype:'삭제', reason:`노출불량 · 밝기 ${s.brt.toFixed(0)}`});
+            } else {
+              deleted.push({...s, rtype:'삭제', reason:`저품질(중복) · 선명도 ${s.blur.toFixed(0)}`});
+            }
+          }
         }
       }
     }
@@ -430,8 +602,16 @@ function score(item, blurThr){
   const blur=lapVar(item.imgData);
   const brt=brightness(item.imgData);
   const badExp=brt<BRT_MIN||brt>BRT_MAX;
+  // isBlurry: 전역 절대 기준 (단독 사진 판단용)
   return{file:item.file, dataURL:item.dataURL, blur, brt,
          isBlurry:blur<blurThr, badExp, quality:blur*(badExp?.5:1)};
+}
+
+// 그룹 내 상대 비교로 흔들림 판단
+// 그룹 최고 선명도 대비 RELATIVE_THR 미만이면 흔들림
+const RELATIVE_THR = 0.55; // 그룹 내 베스트 대비 55% 미만 → 삭제
+function isBlurryRelative(blur, groupMaxBlur){
+  return blur < groupMaxBlur * RELATIVE_THR;
 }
 
 function card(container, c, delay, globalIdx){
